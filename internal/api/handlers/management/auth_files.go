@@ -2471,3 +2471,166 @@ func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 	}
 	return coreauth.WithRequestInfo(ctx, info)
 }
+
+// RefreshCodexToken 刷新指定 Codex 认证文件的 access_token，支持批量操作。
+// 请求 body: {"names": ["a.json", "b.json"]} 或 {"name": "a.json"}（向后兼容）
+// 返回: {"status": "ok", "results": [{"name": "...", "status": "ok/error", ...}]}
+func (h *Handler) RefreshCodexToken(c *gin.Context) {
+	var body struct {
+		Name  string   `json:"name"`
+		Names []string `json:"names"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	// 合并 name 和 names，兼容单文件和批量模式
+	fileNames := body.Names
+	if len(fileNames) == 0 && strings.TrimSpace(body.Name) != "" {
+		fileNames = []string{strings.TrimSpace(body.Name)}
+	}
+	if len(fileNames) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing 'name' or 'names' field"})
+		return
+	}
+
+	authDir := h.cfg.AuthDir
+	if authDir == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "auth directory not configured"})
+		return
+	}
+
+	ctx := context.Background()
+	codexAuth := codex.NewCodexAuth(h.cfg)
+
+	type refreshResult struct {
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Expired string `json:"expired,omitempty"`
+		Email   string `json:"email,omitempty"`
+		Error   string `json:"error,omitempty"`
+	}
+
+	results := make([]refreshResult, 0, len(fileNames))
+
+	for _, rawName := range fileNames {
+		fileName := strings.TrimSpace(rawName)
+		if fileName == "" {
+			continue
+		}
+
+		// 安全检查：防止路径穿越
+		if strings.Contains(fileName, "..") || strings.ContainsAny(fileName, "/\\") {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: "invalid file name"})
+			continue
+		}
+
+		filePath := filepath.Join(authDir, fileName)
+
+		// 读取文件
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: "file not found"})
+			continue
+		}
+
+		// 解析 JSON
+		var fileConfig map[string]any
+		if err = json.Unmarshal(data, &fileConfig); err != nil {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: "failed to parse file"})
+			continue
+		}
+
+		// 验证文件类型
+		fileType, _ := fileConfig["type"].(string)
+		if !strings.EqualFold(fileType, "codex") {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: fmt.Sprintf("unsupported type: %s", fileType)})
+			continue
+		}
+
+		// 提取 refresh_token
+		refreshToken, _ := fileConfig["refresh_token"].(string)
+		refreshToken = strings.TrimSpace(refreshToken)
+		if refreshToken == "" {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: "no refresh_token"})
+			continue
+		}
+
+		// 调用 OpenAI token endpoint 刷新
+		tokenData, errRefresh := codexAuth.RefreshTokens(ctx, refreshToken)
+		if errRefresh != nil {
+			log.Errorf("Failed to refresh codex token for %s: %v", fileName, errRefresh)
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: fmt.Sprintf("refresh failed: %v", errRefresh)})
+			continue
+		}
+
+		// 更新配置字段
+		if strings.TrimSpace(tokenData.AccessToken) != "" {
+			fileConfig["access_token"] = tokenData.AccessToken
+		}
+		if strings.TrimSpace(tokenData.RefreshToken) != "" {
+			fileConfig["refresh_token"] = tokenData.RefreshToken
+		}
+		if strings.TrimSpace(tokenData.IDToken) != "" {
+			fileConfig["id_token"] = tokenData.IDToken
+			// 从新 id_token 中提取 email
+			if claims, errParse := codex.ParseJWTToken(tokenData.IDToken); errParse == nil && claims != nil {
+				if email := claims.GetUserEmail(); email != "" {
+					fileConfig["email"] = email
+				}
+			}
+		}
+		if strings.TrimSpace(tokenData.Email) != "" {
+			fileConfig["email"] = tokenData.Email
+		}
+		if strings.TrimSpace(tokenData.AccountID) != "" {
+			fileConfig["account_id"] = tokenData.AccountID
+		}
+
+		now := time.Now()
+		fileConfig["last_refresh"] = now.Format(time.RFC3339)
+		fileConfig["expired"] = tokenData.Expire
+
+		// 写回文件
+		newData, errMarshal := json.MarshalIndent(fileConfig, "", "  ")
+		if errMarshal != nil {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: "failed to serialize"})
+			continue
+		}
+		if errWrite := os.WriteFile(filePath, newData, 0644); errWrite != nil {
+			results = append(results, refreshResult{Name: fileName, Status: "error", Error: fmt.Sprintf("failed to write: %v", errWrite)})
+			continue
+		}
+
+		// 重新注册到 AuthManager
+		if errReg := h.registerAuthFromFile(ctx, filePath, newData); errReg != nil {
+			log.Warnf("Failed to re-register auth after refresh for %s: %v", fileName, errReg)
+		}
+
+		email, _ := fileConfig["email"].(string)
+		log.Infof("Successfully refreshed codex token for %s, new expiry: %s", fileName, tokenData.Expire)
+		results = append(results, refreshResult{
+			Name:    fileName,
+			Status:  "ok",
+			Expired: tokenData.Expire,
+			Email:   email,
+		})
+	}
+
+	// 统计成功/失败
+	successCount := 0
+	for _, r := range results {
+		if r.Status == "ok" {
+			successCount++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"total":   len(results),
+		"success": successCount,
+		"failed":  len(results) - successCount,
+		"results": results,
+	})
+}
