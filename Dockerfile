@@ -52,3 +52,4 @@ ENV MANAGEMENT_STATIC_PATH=/CLIProxyAPI/static/management.html
 RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
 
 CMD ["./CLIProxyAPI"]
+
