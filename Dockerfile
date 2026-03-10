@@ -10,7 +10,7 @@ RUN git clone --depth 1 https://github.com/wtdemeil/Cli-Proxy-API-Management-Cen
 
 RUN npm install --frozen-lockfile || npm install
 
-RUN npm run build
+RUN npm run build && mv dist/index.html dist/management.html
 
 # ===== 阶段二：编译后端 =====
 FROM golang:1.26-alpine AS builder
