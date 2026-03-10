@@ -6,7 +6,7 @@ RUN apk add --no-cache git
 WORKDIR /frontend
 
 # 从 GitHub 克隆前端项目（使用你自己的 fork 仓库）
-RUN git clone --depth 1 https://github.com/router-for-me/Cli-Proxy-API-Management-Center.git .
+RUN git clone --depth 1 https://github.com/wtdemeil/Cli-Proxy-API-Management-Center.git .
 
 RUN npm install --frozen-lockfile || npm install
 
